@@ -1,0 +1,35 @@
+﻿fastapi==0.104.1
+uvicorn[standard]==0.24.0
+celery==5.3.4
+redis==5.0.1
+python-dotenv==1.0.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+aiofiles==23.2.1
+python-multipart==0.0.6
+
+# PDF Processing
+pdfplumber==0.10.4
+pdfminer.six==20251230
+PyMuPDF==1.23.23
+pypdfium2==5.5.0
+
+# Word Processing
+python-docx==0.8.11
+lxml==6.0.2
+
+# OCR
+paddleocr==2.7.0.3
+paddlepaddle==2.5.2
+pytesseract==0.3.10
+
+# Image Processing
+pillow==10.1.0
+opencv-contrib-python==4.10.0.84
+
+# Supporting Libraries
+numpy==2.4.2
+puremagic==1.30
+
+structlog==24.1.0
+uuid==1.30
