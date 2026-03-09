@@ -2,6 +2,8 @@ import logging
 import os
 import re
 import shutil
+import tempfile
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -109,9 +111,9 @@ class FileProcessor:
 
         # Extract based on file type
         if file_type in ["pdf", "application/pdf"]:
-            text = self._extract_from_pdf(file_path)
+            text = self._extract_pdf_with_layout_awareness(file_path)
         elif file_type in ["docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
-            text = self._extract_from_docx(file_path)
+            text = self._extract_from_docx_with_images(file_path)
         elif file_type in ["doc", "application/msword"]:
             text = self._extract_from_doc(file_path)
         elif file_type in ["txt", "text/plain"]:
@@ -127,6 +129,61 @@ class FileProcessor:
         cleaned_text = self._clean_text(text)
 
         return cleaned_text
+
+    def _extract_pdf_with_layout_awareness(self, file_path: str) -> str:
+        """
+        PDF extraction with layout-aware strategy and robust fallback.
+        This prevents pipeline failures from new extraction logic changes.
+        """
+        text_parts: list[str] = []
+        try:
+            from app.services.layout_aware_extractor import LayoutAwareExtractor
+
+            extractor = LayoutAwareExtractor()
+            result = extractor.extract_with_layout_awareness(file_path)
+
+            main_text = (result or {}).get("text", "")
+            tables_text = (result or {}).get("tables_text", "")
+
+            if main_text:
+                text_parts.append(main_text)
+            if tables_text:
+                text_parts.append("\n--- TABLES ---\n" + tables_text)
+
+            combined = "\n\n".join(text_parts).strip()
+            if self._has_meaningful_text(combined):
+                logger.info(
+                    "Extracted PDF using layout-aware method: %s",
+                    (result or {}).get("extraction_method", "unknown"),
+                )
+                return combined
+            logger.warning("Layout-aware extraction returned limited text, trying hybrid extractor")
+        except Exception as e:
+            logger.warning(f"Layout-aware PDF extraction failed: {e}")
+
+        try:
+            from app.services.hybrid_extractor import HybridLayoutExtractor
+
+            hybrid = HybridLayoutExtractor()
+            result = hybrid.extract_hybrid(file_path)
+            hybrid_text = (result or {}).get("full_text", "").strip()
+            if self._has_meaningful_text(hybrid_text):
+                logger.info("Extracted PDF using hybrid method: %s", (result or {}).get("extraction_method"))
+                return hybrid_text
+            logger.warning("Hybrid extraction returned limited text, trying brute-force OCR")
+        except Exception as e:
+            logger.warning(f"Hybrid PDF extraction failed: {e}")
+
+        try:
+            brute_text = self._brute_force_ocr_pdf(file_path).strip()
+            if self._has_meaningful_text(brute_text):
+                logger.info("Extracted PDF using brute-force OCR fallback")
+                return brute_text
+        except Exception as e:
+            logger.warning(f"Brute-force OCR extraction failed: {e}")
+
+        logger.info("Falling back to legacy PDF extraction strategy")
+        return self._extract_from_pdf(file_path)
 
     def _detect_file_type(self, file_path: str) -> str:
         """Detect file type from extension or content"""
@@ -149,6 +206,13 @@ class FileProcessor:
     def _extract_from_pdf(self, file_path: str) -> str:
         """Extract text from PDF using multiple methods"""
         text_parts = []
+
+        if self.is_screenshot_based(file_path):
+            logger.info("Detected screenshot-based PDF, prioritizing OCR extraction")
+            try:
+                return self._extract_from_image(file_path)
+            except Exception as e:
+                logger.warning(f"OCR-first extraction failed for screenshot-based PDF: {e}")
 
         # Method 1: pdfplumber (good for structured PDFs)
         try:
@@ -181,6 +245,21 @@ class FileProcessor:
         logger.info("Attempting OCR on PDF")
         return self._extract_from_image(file_path)
 
+    def is_screenshot_based(self, file_path: str) -> bool:
+        """Detect whether PDF is mostly image-based with very low native text."""
+        try:
+            image_count = 0
+            text_count = 0
+
+            with fitz.open(file_path) as doc:
+                for page in doc:
+                    image_count += len(page.get_images(full=True) or [])
+                    text_count += len((page.get_text("text") or "").strip())
+
+            return image_count > 3 and text_count < 500
+        except Exception:
+            return False
+
     def _extract_from_docx(self, file_path: str) -> str:
         """Extract text from DOCX files"""
         try:
@@ -190,6 +269,39 @@ class FileProcessor:
         except Exception as e:
             logger.error(f"DOCX extraction failed: {e}")
             raise
+
+    def _extract_from_docx_with_images(self, file_path: str) -> str:
+        """Extract DOCX text including OCR from embedded images."""
+        text_parts: list[str] = []
+        try:
+            doc = Document(file_path)
+            for paragraph in doc.paragraphs:
+                para = (paragraph.text or "").strip()
+                if para:
+                    text_parts.append(para)
+
+            with zipfile.ZipFile(file_path, "r") as docx_zip:
+                for member in docx_zip.namelist():
+                    lower = member.lower()
+                    if not lower.startswith("word/media/"):
+                        continue
+                    if not lower.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif")):
+                        continue
+
+                    try:
+                        image_bytes = docx_zip.read(member)
+                        image_text = self._ocr_image_robust(image_bytes).strip()
+                        if image_text:
+                            text_parts.append(f"[Image Content] {image_text}")
+                    except Exception as ex:
+                        logger.debug("Skipping DOCX image %s due to OCR error: %s", member, ex)
+
+            if text_parts:
+                return "\n".join(text_parts)
+            return self._extract_from_docx(file_path)
+        except Exception as e:
+            logger.warning(f"DOCX extraction with images failed, falling back: {e}")
+            return self._extract_from_docx(file_path)
 
     def _extract_from_doc(self, file_path: str) -> str:
         """Extract text from legacy DOC files"""
@@ -275,6 +387,82 @@ class FileProcessor:
         with Image.open(file_path) as img:
             return self._tesseract_image_to_text(img)
 
+    def _brute_force_ocr_pdf(self, file_path: str) -> str:
+        """Last resort: render all PDF pages and OCR each page."""
+        page_texts: list[str] = []
+        with fitz.open(file_path) as doc:
+            for page_num, page in enumerate(doc):
+                extracted = ""
+                for zoom in (3.0, 2.5, 2.0):
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                    extracted = self._ocr_image_robust(pix.tobytes("png")).strip()
+                    if extracted:
+                        break
+                if not extracted:
+                    extracted = (page.get_text("text") or "").strip()
+                if extracted:
+                    page_texts.append(f"--- Page {page_num + 1} ---\n{extracted}")
+        return "\n\n".join(page_texts).strip()
+
+    def _ocr_image_robust(self, img_data: bytes) -> str:
+        """OCR bytes with preprocessing + backend fallback."""
+        image = Image.open(BytesIO(img_data))
+        candidates: list[Image.Image] = [image, image.convert("L")]
+
+        # Optional OpenCV preprocessing variants.
+        try:
+            import cv2
+            import numpy as np
+
+            gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+            denoised = cv2.fastNlMeansDenoising(gray, h=30)
+            _, otsu = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            adaptive = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                11,
+                2,
+            )
+            candidates.append(Image.fromarray(otsu))
+            candidates.append(Image.fromarray(adaptive))
+        except Exception:
+            pass
+
+        best = ""
+        if TESSERACT_AVAILABLE:
+            for candidate in candidates:
+                try:
+                    text = pytesseract.image_to_string(candidate, lang="eng").strip()
+                    if len(text) > len(best):
+                        best = text
+                except Exception:
+                    continue
+            if best:
+                return best
+
+        # Paddle fallback using temp image file.
+        if self.ocr:
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
+                    candidates[-1].save(temp, format="PNG")
+                    temp_path = temp.name
+                result = self._run_ocr(temp_path)
+                text_parts = self._extract_text_lines(result)
+                return "\n".join(text_parts).strip()
+            except Exception:
+                return best
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+
+        return best
+
     def _tesseract_image_to_text(self, image: Image.Image) -> str:
         """Run Tesseract with light pre-processing for better OCR stability."""
         gray = image.convert("L")
@@ -344,9 +532,14 @@ class FileProcessor:
         if not text:
             return ""
 
-        text = re.sub(r"\s+", " ", text)
         text = text.replace("\x00", "")
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # Preserve line boundaries while normalizing noisy horizontal whitespace.
+        text = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n"))
+        text = re.sub(r"\n{3,}", "\n\n", text)
         text = "".join(char for char in text if char == "\n" or char == "\t" or ord(char) >= 32)
-
         return text.strip()
+
+    def _has_meaningful_text(self, text: str, min_chars: int = 100) -> bool:
+        cleaned = (text or "").strip()
+        return len(cleaned) >= min_chars

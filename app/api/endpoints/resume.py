@@ -1,4 +1,6 @@
-﻿import logging
+import logging
+import os
+import tempfile
 from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -6,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.models.job import JobResponse, JobResult
+from app.services.layout_detector import LayoutDetector
 from app.services.resume_service import ResumeService
 
 router = APIRouter(prefix="/resume", tags=["resume"])
@@ -117,3 +120,51 @@ async def get_extracted_text(job_id: str):
             "text_length": len(job.raw_text),
         }
     )
+
+
+@router.post("/layout/analyze")
+async def analyze_layout(file: UploadFile = File(...)):
+    """
+    Analyze layout of an uploaded PDF for extraction diagnostics.
+    """
+    file_ext = f".{file.filename.split('.')[-1].lower()}" if "." in file.filename else ""
+    if file_ext != ".pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files are supported for layout analysis")
+
+    content = await file.read()
+    if len(content) > settings.MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size should be less than or equal to {settings.MAX_FILE_SIZE // (1024 * 1024)}MB",
+        )
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp:
+            temp.write(content)
+            temp_path = temp.name
+
+        detector = LayoutDetector()
+        layout = detector.analyze_document(temp_path)
+
+        return JSONResponse(
+            content={
+                "file_name": file.filename,
+                "layout_type": layout["layout_type"].value,
+                "column_count": layout["column_count"],
+                "has_tables": layout["has_tables"],
+                "has_images": layout["has_images"],
+                "pages": layout["pages"],
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Layout analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                logger.warning("Failed to remove temporary file used for layout analysis")
