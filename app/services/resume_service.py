@@ -1,6 +1,7 @@
 import logging
 import shutil
 import uuid
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -9,6 +10,7 @@ import redis
 
 from app.config import settings
 from app.models.job import JobResult
+from app.models.poc1_models import POC1Output
 from app.workers.tasks import celery_app
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,27 @@ class ResumeService:
 
     def __init__(self):
         self.redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        self.ai_processor = None
+        self.db_service = None
+
+        if settings.GEMINI_API_KEY:
+            try:
+                from app.services.ai_processor import AIResumeProcessor
+
+                self.ai_processor = AIResumeProcessor(api_key=settings.GEMINI_API_KEY)
+                logger.info("AI Resume Processor initialized")
+            except Exception as ex:
+                logger.warning("AI Resume Processor unavailable: %s", ex)
+        else:
+            logger.warning("GEMINI_API_KEY missing in settings; AI processor disabled")
+
+        try:
+            from app.services.db_service import DatabaseService
+
+            self.db_service = DatabaseService()
+            logger.info("Database service initialized")
+        except Exception as ex:
+            logger.warning("Database service unavailable: %s", ex)
 
     async def submit_resume(self, file_content: bytes, filename: str, candidate_id: Optional[str] = None) -> str:
         """
@@ -76,11 +99,49 @@ class ResumeService:
             return None
         return JobResult.model_validate_json(job_json)
 
+    def get_processed_profile(self, job_id: str) -> Optional[POC1Output]:
+        profile_json = self.redis_client.get(f"profile:{job_id}")
+        if not profile_json:
+            return None
+        try:
+            return POC1Output.model_validate_json(profile_json)
+        except Exception as ex:
+            logger.error("Failed to decode profile for job_id=%s: %s", job_id, ex)
+            return None
+
+    def save_processed_profile(self, job_id: str, profile: POC1Output):
+        self.redis_client.set(
+            f"profile:{job_id}",
+            profile.model_dump_json(),
+            ex=86400,
+        )
+
+    def save_profile_to_db(self, profile: POC1Output, job_id: str, raw_text: Optional[str]) -> bool:
+        if not self.db_service:
+            return False
+        try:
+            asyncio.run(self.db_service.save_candidate_profile(profile, job_id, raw_text=raw_text))
+            return True
+        except Exception as ex:
+            logger.warning("Failed to persist profile to DB for job_id=%s: %s", job_id, ex)
+            # Retry once with a fresh DB service to avoid stale async engine/loop state.
+            try:
+                from app.services.db_service import DatabaseService
+
+                fresh_db_service = DatabaseService()
+                asyncio.run(fresh_db_service.save_candidate_profile(profile, job_id, raw_text=raw_text))
+                logger.info("DB persist retry succeeded for job_id=%s", job_id)
+                return True
+            except Exception as retry_ex:
+                logger.warning("DB persist retry failed for job_id=%s: %s", job_id, retry_ex)
+                return False
+
     def update_job_result(
         self,
         job_id: str,
         status: str,
         raw_text: Optional[str] = None,
+        profile: Optional[POC1Output] = None,
         error: Optional[str] = None,
     ):
         """Update job result (called by Celery task)"""
@@ -98,6 +159,9 @@ class ResumeService:
             job.completed_at = datetime.utcnow()
 
         self._save_job(job)
+
+        if profile:
+            self.save_processed_profile(job_id, profile)
 
         # Clean up temp files if completed/failed
         if status in ["completed", "failed"]:

@@ -1,6 +1,7 @@
 import logging
 import platform
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -9,6 +10,7 @@ from celery.signals import worker_ready
 import redis
 
 from app.config import settings
+from app.models.poc1_models import ParseStatus, POC1Output, PersonalInfo, StorageInfo
 from app.services.file_processor import FileProcessor
 
 IS_WINDOWS = platform.system().lower().startswith("win")
@@ -37,6 +39,7 @@ celery_app.conf.update(
     task_routes={
         "process_resume": {"queue": settings.CELERY_QUEUE},
         "process_resume_v2": {"queue": settings.CELERY_QUEUE},
+        "reprocess_with_ai": {"queue": settings.CELERY_QUEUE},
     },
 )
 
@@ -99,9 +102,11 @@ def process_resume_task(
     self, job_id: str, file_path: str, filename: str, candidate_id: Optional[str] = None
 ):
     """
-    Background task to process resume and extract text
+    Background task to process resume and extract text + structured profile.
     """
     logger.info(f"Starting resume processing: job_id={job_id}, file={filename}")
+    service = None
+    resolved_candidate_id = candidate_id or f"CAND-{uuid.uuid4().hex[:8].upper()}"
 
     try:
         service = _get_resume_service()
@@ -121,19 +126,65 @@ def process_resume_task(
 
         extraction_time = time.time() - start_time
 
+        # AI processing for POC1 profile
+        profile = None
+        ai_processing_time = 0.0
+        if service.ai_processor:
+            try:
+                ai_start = time.time()
+                profile = service.ai_processor.process_resume(
+                    raw_text=raw_text,
+                    candidate_id=resolved_candidate_id,
+                    file_name=filename,
+                )
+                ai_processing_time = time.time() - ai_start
+            except Exception as ex:
+                logger.error("AI processing failed for job_id=%s: %s", job_id, ex)
+                profile = POC1Output(
+                    candidate_id=resolved_candidate_id,
+                    parse_status=ParseStatus.FAILED,
+                    confidence_score=0.0,
+                    personal_info=PersonalInfo(),
+                    parsing_warnings=[f"AI processing failed: {ex}"],
+                    storage=StorageInfo(
+                        table="candidates_staging",
+                        candidate_status="MANUAL_REVIEW",
+                        awaiting="Manual review required",
+                    ),
+                    raw_text=raw_text[:1000],
+                )
+        else:
+            profile = POC1Output(
+                candidate_id=resolved_candidate_id,
+                parse_status=ParseStatus.FAILED,
+                confidence_score=0.0,
+                personal_info=PersonalInfo(),
+                parsing_warnings=["AI processor not available - raw text only"],
+                storage=StorageInfo(
+                    table="candidates_staging",
+                    candidate_status="MANUAL_REVIEW",
+                    awaiting="Manual review required",
+                ),
+                raw_text=raw_text[:1000],
+            )
+
+        service.save_profile_to_db(profile, job_id=job_id, raw_text=raw_text)
+
         # Create extraction result
         result = {
             "job_id": job_id,
-            "candidate_id": candidate_id,
-            "raw_text": raw_text,
+            "candidate_id": resolved_candidate_id,
             "file_name": filename,
             "file_type": file_type,
             "text_length": len(raw_text),
             "extraction_time": extraction_time,
+            "ai_processing_time": ai_processing_time,
+            "confidence_score": profile.confidence_score if profile else 0.0,
+            "parse_status": profile.parse_status.value if profile else "FAILED",
         }
 
         # Update job with result
-        service.update_job_result(job_id, "completed", raw_text=raw_text)
+        service.update_job_result(job_id, "completed", raw_text=raw_text, profile=profile)
 
         logger.info(
             f"Completed resume processing: job_id={job_id}, time={extraction_time:.2f}s"
@@ -154,7 +205,8 @@ def process_resume_task(
             retry_msg = f"{err} (retry {self.request.retries + 1}/{max_retries})"
             try:
                 # Keep job non-terminal so temporary files are preserved for retry.
-                service.update_job_result(job_id, "pending", error=retry_msg)
+                if service:
+                    service.update_job_result(job_id, "pending", error=retry_msg)
             except Exception:
                 logger.exception(
                     f"Failed to update pending status before retry: job_id={job_id}"
@@ -162,7 +214,46 @@ def process_resume_task(
             raise self.retry(exc=e, countdown=60, max_retries=max_retries)
 
         try:
-            service.update_job_result(job_id, "failed", error=err)
+            if service:
+                service.update_job_result(job_id, "failed", error=err)
+            else:
+                _mark_job_failed_direct(job_id, err)
         except Exception:
             _mark_job_failed_direct(job_id, err)
+        raise
+
+
+@celery_app.task(bind=True, name="reprocess_with_ai")
+def reprocess_with_ai_task(
+    self,
+    job_id: str,
+    raw_text: str,
+    candidate_id: Optional[str] = None,
+):
+    """Reprocess existing raw text using AI profile generation only."""
+    logger.info("Starting AI reprocess: job_id=%s", job_id)
+    service = _get_resume_service()
+    service.update_job_result(job_id, "processing")
+
+    try:
+        if not service.ai_processor:
+            raise RuntimeError("AI processor unavailable")
+
+        profile = service.ai_processor.process_resume(
+            raw_text=raw_text,
+            candidate_id=candidate_id or f"CAND-{uuid.uuid4().hex[:8].upper()}",
+            file_name="reprocess",
+        )
+        service.save_profile_to_db(profile, job_id=job_id, raw_text=raw_text)
+        service.update_job_result(job_id, "completed", raw_text=raw_text, profile=profile)
+        return {
+            "job_id": job_id,
+            "candidate_id": profile.candidate_id,
+            "confidence_score": profile.confidence_score,
+            "parse_status": profile.parse_status.value,
+        }
+    except Exception as ex:
+        err = str(ex)
+        logger.error("AI reprocess failed: job_id=%s error=%s", job_id, err)
+        service.update_job_result(job_id, "failed", error=err)
         raise

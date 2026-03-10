@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -28,6 +29,10 @@ class Settings(BaseSettings):
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
+
+    # PostgreSQL settings
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost/smartrecruitz"
+    GEMINI_API_KEY: Optional[str] = None
 
     # Logging
     LOG_LEVEL: str = "INFO"

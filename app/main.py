@@ -51,6 +51,12 @@ async def startup_event():
         broker=settings.CELERY_BROKER_URL,
         queue=settings.CELERY_QUEUE,
     )
+    if resume_service.db_service:
+        try:
+            await resume_service.db_service.init_models()
+            logger.info("Database models initialized")
+        except Exception as ex:
+            logger.warning("Database model initialization skipped: %s", ex)
 
 
 @app.on_event("shutdown")

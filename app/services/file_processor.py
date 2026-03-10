@@ -12,6 +12,7 @@ import fitz  # PyMuPDF
 import pdfplumber
 from docx import Document
 from PIL import Image
+from app.config import settings
 
 # Work around Paddle CPU runtime issues on Windows (oneDNN + PIR path).
 # These must be set before importing paddle/paddleocr.
@@ -44,6 +45,18 @@ class FileProcessor:
     def __init__(self):
         self._configure_tesseract()
         self.ocr = None
+        self.gemini_extractor = None
+        if settings.GEMINI_API_KEY:
+            try:
+                from app.services.ai_extractor import GeminiExtractor
+
+                self.gemini_extractor = GeminiExtractor(
+                    api_key=settings.GEMINI_API_KEY,
+                    model_name="gemini-2.5-flash",
+                )
+                logger.info("Gemini extractor initialized with gemini-2.5-flash")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Gemini extractor: {e}")
         if PADDLE_AVAILABLE:
             self.ocr = self._init_paddle_ocr()
 
@@ -338,6 +351,35 @@ class FileProcessor:
     def _extract_from_image(self, file_path: str) -> str:
         """Extract text from images using OCR with backend fallback."""
         errors = []
+        suffix = Path(file_path).suffix.lower()
+        image_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
+
+        # Gemini-first path for image files only.
+        if suffix in image_suffixes:
+            if self.gemini_extractor:
+                try:
+                    logger.info("Attempting Gemini extraction for image: %s", file_path)
+                    gemini_text = self.gemini_extractor.extract_from_image(file_path)
+                    if self._is_sufficient_extraction(gemini_text):
+                        logger.info("Gemini extraction successful: %s chars", len(gemini_text.strip()))
+                        return gemini_text.strip()
+                    errors.append("Gemini returned insufficient text")
+                    logger.warning("Gemini extraction returned limited text, using OCR fallbacks")
+                except Exception as e:
+                    errors.append(f"Gemini failed: {e}")
+                    logger.warning("Gemini extraction failed, using OCR fallbacks: %s", e)
+
+        # Enhanced image-only OCR path (layout-aware + preprocessing).
+        # Keep existing OCR stack as fallback to avoid pipeline regressions.
+        if suffix in image_suffixes:
+            try:
+                enhanced_text = self._extract_image_with_layout_enhancer(file_path)
+                if enhanced_text:
+                    return enhanced_text
+                errors.append("Enhanced OCR returned empty text")
+            except Exception as e:
+                errors.append(f"Enhanced OCR failed: {e}")
+                logger.warning("Enhanced image OCR failed, using legacy OCR fallback: %s", e)
 
         if self.ocr:
             try:
@@ -366,6 +408,86 @@ class FileProcessor:
             + " | ".join(errors)
             + " | Install/configure at least one OCR backend (PaddleOCR or pytesseract+tesseract)."
         )
+
+    def _extract_image_with_layout_enhancer(self, file_path: str) -> str:
+        """Run layout-aware OCR for image formats with current OCR backends."""
+        from app.services.image_layout_analyzer import ImageOCREnhancer
+
+        with Image.open(file_path) as image:
+            # Avoid repeated Gemini calls for each preprocessed candidate image.
+            enhancer = ImageOCREnhancer(
+                ocr_func=lambda img, cfg=None: self._ocr_image_with_available_backends(
+                    img,
+                    config=cfg,
+                    allow_gemini=False,
+                )
+            )
+            return enhancer.extract_text_with_layout(image).strip()
+
+    def _ocr_image_with_available_backends(
+        self,
+        image: Image.Image,
+        config: Optional[str] = None,
+        allow_gemini: bool = True,
+    ) -> str:
+        """OCR helper used by layout enhancer with Tesseract-first backend preference."""
+        if allow_gemini and self.gemini_extractor:
+            gemini_text = self._extract_with_gemini_image(image)
+            if self._is_sufficient_extraction(gemini_text):
+                return gemini_text.strip()
+
+        if TESSERACT_AVAILABLE:
+            try:
+                kwargs = {"lang": "eng"}
+                if config:
+                    kwargs["config"] = config
+                text = (pytesseract.image_to_string(image, **kwargs) or "").strip()
+                if text:
+                    return text
+            except Exception as ex:
+                logger.debug("Tesseract OCR callback failed: %s", ex)
+
+        if self.ocr:
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
+                    image.convert("RGB").save(temp, format="PNG")
+                    temp_path = temp.name
+                result = self._run_ocr(temp_path)
+                text = "\n".join(self._extract_text_lines(result)).strip()
+                if text:
+                    return text
+            except Exception as ex:
+                logger.debug("Paddle OCR callback failed: %s", ex)
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+
+        return ""
+
+    def _extract_with_gemini_image(self, image: Image.Image) -> str:
+        """Extract text with Gemini from a PIL image via temporary file transport."""
+        if not self.gemini_extractor:
+            return ""
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
+                image.convert("RGB").save(temp, format="PNG")
+                temp_path = temp.name
+            return (self.gemini_extractor.extract_from_image(temp_path) or "").strip()
+        except Exception as ex:
+            logger.debug("Gemini image callback failed: %s", ex)
+            return ""
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
     def _extract_with_tesseract(self, file_path: str) -> str:
         """
@@ -542,4 +664,12 @@ class FileProcessor:
 
     def _has_meaningful_text(self, text: str, min_chars: int = 100) -> bool:
         cleaned = (text or "").strip()
+        return len(cleaned) >= min_chars
+
+    def _is_sufficient_extraction(self, text: str, min_chars: int = 50) -> bool:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return False
+        if cleaned.startswith("[") and cleaned.endswith("]"):
+            return False
         return len(cleaned) >= min_chars

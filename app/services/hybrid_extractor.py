@@ -9,6 +9,7 @@ import fitz
 import pdfplumber
 from PIL import Image
 
+from app.config import settings
 from app.services.table_extractor import TableExtractor, format_table_to_text
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,17 @@ class HybridLayoutExtractor:
 
     def __init__(self):
         self.table_extractor = TableExtractor()
+        self.gemini_extractor = None
+        if settings.GEMINI_API_KEY:
+            try:
+                from app.services.ai_extractor import GeminiExtractor
+
+                self.gemini_extractor = GeminiExtractor(
+                    api_key=settings.GEMINI_API_KEY,
+                    model_name="gemini-2.5-flash",
+                )
+            except Exception as ex:
+                logger.debug("Hybrid extractor Gemini init skipped: %s", ex)
 
     def extract_hybrid(self, file_path: str) -> Dict[str, Any]:
         # Fast path for scanned/screenshot-style PDFs.
@@ -176,26 +188,7 @@ class HybridLayoutExtractor:
                     return text.strip()
             except Exception as ex:
                 logger.debug("Tesseract OCR failed for image bytes: %s", ex)
-
-        # Fallback to FileProcessor OCR stack (Paddle/Tesseract auto handling).
-        temp_path = None
-        try:
-            from app.services.file_processor import FileProcessor
-
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
-                temp.write(img_data)
-                temp_path = temp.name
-            processor = FileProcessor()
-            return processor._extract_from_image(temp_path).strip()
-        except Exception as ex:
-            logger.debug("Fallback OCR failed for image bytes: %s", ex)
-            return ""
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    logger.debug("Failed to remove temporary OCR image: %s", temp_path)
+        return ""
 
     def _ocr_with_fallback(self, file_path: str) -> str:
         """Ultimate fallback OCR over all pages and zoom levels."""
@@ -282,6 +275,11 @@ class HybridLayoutExtractor:
         return self.table_extractor.extract_tables_preserve_structure(file_path)
 
     def _extract_image_region(self, file_path: str, region: DocumentRegion) -> str:
+        enhanced = self._extract_screenshot_region(file_path, region)
+        if enhanced:
+            return enhanced
+
+        # Preserve previous fallback behavior.
         try:
             with fitz.open(file_path) as doc:
                 page = doc[region.page_num]
@@ -290,6 +288,70 @@ class HybridLayoutExtractor:
             return text if text else "[Screenshot region - OCR failed]"
         except Exception:
             return "[Screenshot region - OCR failed]"
+
+    def _extract_screenshot_region(self, file_path: str, region: DocumentRegion) -> str:
+        """Layout-aware OCR for screenshot-heavy regions with safe fallback."""
+        try:
+            with fitz.open(file_path) as doc:
+                page = doc[region.page_num]
+                pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0), clip=fitz.Rect(region.bbox))
+
+            from app.services.image_layout_analyzer import ImageOCREnhancer
+
+            with Image.open(BytesIO(pix.tobytes("png"))) as image:
+                # Region OCR should stay local; avoid Gemini fan-out across many regions.
+                enhancer = ImageOCREnhancer(ocr_func=self._ocr_pil_local)
+                local_text = enhancer.extract_text_with_layout(image).strip()
+                if self._is_region_text_sufficient(local_text):
+                    return local_text
+
+                # Single Gemini fallback for low-quality region OCR.
+                gemini_text = self._ocr_region_with_gemini_once(image)
+                if self._is_region_text_sufficient(gemini_text):
+                    return gemini_text.strip()
+
+                return local_text
+        except Exception as ex:
+            logger.debug("Enhanced screenshot region OCR failed: %s", ex)
+            return ""
+
+    def _ocr_pil_local(self, image: Image.Image, config: str | None = None) -> str:
+        if TESSERACT_AVAILABLE:
+            try:
+                kwargs = {"lang": "eng"}
+                if config:
+                    kwargs["config"] = config
+                return (pytesseract.image_to_string(image.convert("L"), **kwargs) or "").strip()
+            except Exception as ex:
+                logger.debug("Local tesseract OCR failed: %s", ex)
+        return ""
+
+    def _ocr_region_with_gemini_once(self, image: Image.Image) -> str:
+        if not self.gemini_extractor:
+            return ""
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
+                image.convert("RGB").save(temp, format="PNG")
+                temp_path = temp.name
+            return (self.gemini_extractor.extract_from_image(temp_path) or "").strip()
+        except Exception as ex:
+            logger.debug("Gemini fallback for region OCR failed: %s", ex)
+            return ""
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    def _is_region_text_sufficient(self, text: str, min_chars: int = 120) -> bool:
+        cleaned = (text or "").strip()
+        if len(cleaned) < min_chars:
+            return False
+        # Heuristic for heavily corrupted OCR outputs.
+        alnum = sum(ch.isalnum() for ch in cleaned)
+        return (alnum / max(len(cleaned), 1)) >= 0.55
 
     def _extract_text_region(self, file_path: str, region: DocumentRegion) -> str:
         with fitz.open(file_path) as doc:

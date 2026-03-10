@@ -8,8 +8,10 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.models.job import JobResponse, JobResult
+from app.models.poc1_models import POC1Output
 from app.services.layout_detector import LayoutDetector
 from app.services.resume_service import ResumeService
+from app.workers.tasks import celery_app
 
 router = APIRouter(prefix="/resume", tags=["resume"])
 logger = logging.getLogger(__name__)
@@ -120,6 +122,68 @@ async def get_extracted_text(job_id: str):
             "text_length": len(job.raw_text),
         }
     )
+
+
+@router.get("/{job_id}/profile", response_model=POC1Output)
+async def get_candidate_profile(job_id: str):
+    """
+    Get the complete processed candidate profile.
+    """
+    if not resume_service:
+        raise HTTPException(status_code=500, detail="Service not initialized")
+
+    profile = resume_service.get_processed_profile(job_id)
+    if not profile:
+        job = resume_service.get_job_status(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status != "completed":
+            raise HTTPException(status_code=202, detail="Processing still in progress")
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    return profile
+
+
+@router.get("/{job_id}/profile/json")
+async def get_candidate_profile_json(job_id: str):
+    """
+    Get profile in raw JSON format.
+    """
+    if not resume_service:
+        raise HTTPException(status_code=500, detail="Service not initialized")
+
+    profile = resume_service.get_processed_profile(job_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    return JSONResponse(content=profile.model_dump(mode="json"))
+
+
+@router.post("/{job_id}/reprocess")
+async def reprocess_with_ai(job_id: str):
+    """
+    Reprocess an existing job's raw text via AI.
+    """
+    if not resume_service:
+        raise HTTPException(status_code=500, detail="Service not initialized")
+
+    job = resume_service.get_job_status(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.raw_text:
+        raise HTTPException(status_code=400, detail="No raw text available")
+
+    celery_app.send_task(
+        "reprocess_with_ai",
+        kwargs={
+            "job_id": job_id,
+            "raw_text": job.raw_text,
+            "candidate_id": job.candidate_id,
+        },
+        queue=settings.CELERY_QUEUE,
+    )
+
+    return {"status": "reprocessing_started", "job_id": job_id}
 
 
 @router.post("/layout/analyze")
