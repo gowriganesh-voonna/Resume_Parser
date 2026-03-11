@@ -335,6 +335,9 @@ class AIResumeProcessor:
     graduation_year
     gpa
 
+    graduation_year must be integer (YYYY) or null.
+    If education is ongoing (e.g., present/current/ongoing/till date), set graduation_year = null.
+
     -----------------------------------------------------
 
     SKILLS EXTRACTION
@@ -781,9 +784,30 @@ class AIResumeProcessor:
                 or item.get("school")
                 or "Unknown Institution"
             )
+        item["graduation_year"] = self._normalize_graduation_year(
+            item.get("graduation_year")
+        )
         gpa = item.get("gpa")
         item["gpa"] = self._to_float(gpa)
         return item
+
+    def _normalize_graduation_year(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                return None
+            if normalized in {"present", "current", "ongoing", "till date", "till-date"}:
+                return None
+            years = re.findall(r"\b(19\d{2}|20\d{2}|21\d{2})\b", normalized)
+            if years:
+                return int(years[-1])
+        return None
 
     def _coerce_experience_item(self, item: dict) -> dict:
         company = (
