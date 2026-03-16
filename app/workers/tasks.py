@@ -181,13 +181,19 @@ def process_resume_task(
             "ai_processing_time": ai_processing_time,
             "confidence_score": profile.confidence_score if profile else 0.0,
             "parse_status": profile.parse_status.value if profile else "FAILED",
+            "duplicate_status": profile.storage.candidate_status
+            if profile and profile.storage
+            else "UNKNOWN",
         }
 
         # Update job with result
         service.update_job_result(job_id, "completed", raw_text=raw_text, profile=profile)
 
         logger.info(
-            f"Completed resume processing: job_id={job_id}, time={extraction_time:.2f}s"
+            "Completed resume processing: job_id=%s, time=%.2fs, duplicate_status=%s",
+            job_id,
+            extraction_time,
+            result["duplicate_status"],
         )
         return result
 
